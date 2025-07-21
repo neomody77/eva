@@ -6,4 +6,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "prompt-toolkit>=3.0.51",
+    "psutil>=7.0.0",
+    "scapy>=2.6.1",
 ]
