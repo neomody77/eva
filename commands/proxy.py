@@ -1,106 +1,176 @@
-import socket
-import subprocess
+from inspect import signature
 import ipaddress
-import concurrent.futures
+import subprocess
 import psutil
-from prompt_toolkit import print_formatted_text
-from prompt_toolkit.formatted_text import HTML
-from scapy.layers.l2 import ARP, Ether
-from scapy.sendrecv import srp
+import socket  
+import typer
+
+import socket
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typer import colors
+from log import logger
+
+app = typer.Typer(invoke_without_command=True)
 
 
-class ProxyCommand:
-    def __init__(self):
-        self.network = self.get_local_network()
+@app.callback()
+def default(ctx: typer.Context):
+    """
+    proxy 命令入口。未指定子命令时默认执行 scan。
+    """
+    if ctx.invoked_subcommand is None:
+        origin_scan(None, 7890)
 
-    def get_local_ip(self):
-        # 获取本地机器的 IP 地址
+
+def scan(
+    subnet: str|None = typer.Option(None, '--subnet', '-s', help="搜索范围"),
+    port: int = typer.Option(7890, '--port', '-p', help="代理端口"),
+
+):
+    """
+    扫描可用的代理
+    """
+    ips = {}
+    
+    if subnet:
+        ips['input'] = subnet.split('/')
+    else:
+        # 获取所有网络接口的地址信息
         for interface, addrs in psutil.net_if_addrs().items():
             for addr in addrs:
-                if addr.family == socket.AF_INET:
-                    return addr.address
-        return None
+                if addr.family == socket.AF_INET:  # 只处理 IPv4 地址
+                    network = ipaddress.IPv4Network(f'{addr.address}/{addr.netmask}', strict=False)
+                    ips[interface] = str(network.network_address) , str(network.prefixlen)
+    
+    endpoints = []
+    for interface, (addr,prefix) in ips.items():
+        if interface=='lo':
+            continue
+        logger.debug(f"{interface}: {addr}/{prefix}")
+        
+        eps = scan_subnet_for_port(f"{addr}/{prefix}", port)
+        endpoints.extend(eps)
+    for ep in endpoints:
+        logger.debug(f"endpoint: {ep}:{port}")
+        
+        typer.echo(typer.style(f'\n执行以下命令以设置代理:', fg=colors.CYAN))
+        if check_socks5_proxy(ep, port):
+            cmd = f'\texport http_proxy=socks5://{ep}:7890 https_proxy=socks5://{ep}:7890 all_proxy=socks5://{ep}:7890'
+            
+            typer.echo(typer.style(cmd, fg=colors.YELLOW))
+                    
+origin_scan = scan
+scan = app.command()(scan)
 
-    def get_local_network(self):
-        local_ip = self.get_local_ip()
-        if local_ip:
-            # 计算子网网段
-            network = ipaddress.IPv4Network(f'{local_ip}/24', strict=False)
-            return network
-        return None
 
-    def scan_proxy_ports(self, ip, ports=[80, 8080, 3128, 1080]):
-        # 扫描指定端口
-        open_ports = []
-        for port in ports:
+def scan_host_port(ip: str, port: int, timeout: float = 0.3) -> bool:
+    """尝试连接目标IP的指定端口，返回是否开放"""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+    
+
+def scan_subnet_for_port(cidr: str, port: int):
+    """扫描子网内开启了指定端口的主机"""
+    network = ipaddress.ip_network(cidr, strict=False)
+
+    logger.info(f"Scanning {cidr} for port {port}...")
+
+    with ThreadPoolExecutor(max_workers=100) as executor:
+        future_to_ip = {
+            executor.submit(scan_host_port, str(ip), port): str(ip)
+            for ip in network.hosts()
+        }
+
+        for future in as_completed(future_to_ip):
+            ip = future_to_ip[future]
             try:
-                sock = socket.create_connection((ip, port), timeout=1)
-                sock.close()
-                open_ports.append(port)
-            except socket.error:
-                pass
-        return open_ports
-
-    def verify_http_proxy(self, ip, port):
-        # 验证 HTTP 代理
-        try:
-            sock = socket.create_connection((ip, port), timeout=1)
-            sock.sendall(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
-            response = sock.recv(1024)
-            if b"HTTP" in response:
-                print_formatted_text(HTML(f"<ansigreen>HTTP Proxy found at {ip}:{port}</ansigreen>"))
-            sock.close()
-        except socket.error:
-            pass
-
-    def verify_socks_proxy(self, ip, port):
-        # 验证 SOCKS 代理
-        try:
-            sock = socket.create_connection((ip, port), timeout=1)
-            sock.sendall(b"\x05\x01\x00")  # SOCKS5 握手请求
-            response = sock.recv(2)
-            if response == b"\x05\x00":
-                print_formatted_text(HTML(f"<ansigreen>SOCKS Proxy found at {ip}:{port}</ansigreen>"))
-            sock.close()
-        except socket.error:
-            pass
-
-    def discover_hosts(self):
-        # 扫描子网内的活跃主机
-        arp_request = ARP(pdst=str(self.network))
-        ether_frame = Ether(dst="ff:ff:ff:ff:ff:ff")
-        arp_request_broadcast = ether_frame / arp_request
-        result = srp(arp_request_broadcast, timeout=3, verbose=False)[0]
-
-        hosts = []
-        for sent, received in result:
-            hosts.append(received.psrc)
-        return hosts
-
-    def scan_network(self):
-        # 扫描局域网并验证代理
-        hosts = self.discover_hosts()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = []
-            for ip in hosts:
-                futures.append(executor.submit(self.check_for_proxies, ip))
-
-            # 等待所有任务完成
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
-
-    def check_for_proxies(self, ip):
-        # 检查 HTTP 和 SOCKS 代理
-        open_ports = self.scan_proxy_ports(ip)
-        if 8080 in open_ports or 3128 in open_ports:
-            self.verify_http_proxy(ip, 8080)
-            self.verify_http_proxy(ip, 3128)
-        if 1080 in open_ports:
-            self.verify_socks_proxy(ip, 1080)
-
-    def run(self):
-        # 执行代理扫描
-        print_formatted_text(HTML("<skyblue>Scanning the network for proxies...</skyblue>"))
-        self.scan_network()
+                if future.result():
+                    yield ip 
+            except Exception as e:
+                print(f"❌ {ip}:{port} error: {e}")
 
 
+
+@app.command()
+def test_scan():
+    endpoints = scan_subnet_for_port("192.168.2.245/24", 7890)
+    for ep in endpoints:
+        print('ep:', ep)
+
+
+
+import socket
+import requests
+import socks
+import ssl
+from urllib.request import urlopen, Request
+from urllib.error import URLError
+
+def check_socks5_proxy(host, port):
+    """检测 SOCKS5 代理"""
+    try:
+        # 通过 SOCKS5 代理连接
+        socks.set_default_proxy(socks.SOCKS5, host, port)
+        socket.socket = socks.socksocket  # 将所有 socket 请求通过 SOCKS 代理
+        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_socket.connect(("httpbin.org", 80))  # 测试连接到外部网站
+        return True
+    except Exception as e:
+        print(f"SOCKS5代理检测失败: {e}")
+        return False
+
+def check_http_proxy(host, port):
+    """检测 HTTP 代理"""
+    try:
+        proxy_url = f"http://{host}:{port}"
+        response = requests.get("https://example.com", proxies={"http": proxy_url, "https": proxy_url}, timeout=5)
+        if response.status_code == 200:
+            return True
+        else:
+            return False
+    except requests.RequestException as e:
+        print(f"HTTP代理检测失败: {e}")
+        return False
+
+def check_https_proxy(host, port):
+    """检测 HTTPS 代理"""
+    try:
+        proxy_url = f"http://{host}:{port}"
+        response = requests.get("https://example.com", proxies={"http": proxy_url, "https": proxy_url}, timeout=5)
+        if response.status_code == 200:
+            return True
+        else:
+            return False
+    except requests.RequestException as e:
+        print(f"HTTPS代理检测失败: {e}")
+        return False
+
+def detect_proxy_type(host, port):
+    """检测代理类型"""
+    if check_socks5_proxy(host, port):
+        print("代理类型: SOCKS5")
+    if check_http_proxy(host, port):
+        print("代理类型: HTTP")
+    if check_https_proxy(host, port):
+        print("代理类型: HTTPS")
+    else:
+        print("未识别的代理类型")
+
+
+def test1():# 测试
+    host = "192.168.2.1"
+    port = 7890
+    detect_proxy_type(host, port)
+
+
+
+
+
+
+
+if __name__ == "__main__":
+    app()

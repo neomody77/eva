@@ -1,30 +1,22 @@
-from prompt_toolkit import Application
-from prompt_toolkit.key_binding import KeyBindings
+import typer
+import sys
+ 
+from commands import register_sub_commands
+from log import logger
 
-from commands.proxy import ProxyCommand
-
-# 设置键盘绑定
-bindings = KeyBindings()
-
-
-@bindings.add('c-q')  # 按 Ctrl-Q 退出
-def _(event):
-    event.app.exit()
+app = typer.Typer()
 
 
-# 主命令行应用
-def main():
-    # 通过命令实现
-    application = Application(
-        layout=None,  # 使用默认布局
-        key_bindings=bindings,
-        full_screen=True
-    )
-    proxy_command = ProxyCommand()  # 加载 proxy 子命令
-    proxy_command.run()
+register_sub_commands(app)
 
-    application.run()
-
+@app.command()
+def greet(name: str):
+    """
+    打招呼的命令
+    """
+    typer.echo(f"Hello {name}!")
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 1:  # 如果没有传递任何命令
+        sys.argv.append('--help')  # 强制调用 help
+    app()

@@ -8,4 +8,5 @@ dependencies = [
     "prompt-toolkit>=3.0.51",
     "psutil>=7.0.0",
     "scapy>=2.6.1",
+    "typer>=0.16.0",
 ]
